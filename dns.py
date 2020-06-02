@@ -19,8 +19,8 @@ def load_records_info():
     return json_info
 
 
-def make_info_from_response(data, domain):
-    question = build_question(domain, 'a')
+def make_info_from_response(data, domain, qtype):
+    question = build_question(domain, qtype)
     ANCOUNT = int.from_bytes(data[6:8], 'big')
     answer = data[12 + len(question):]
     records = get_records_from_answer(answer, ANCOUNT)
@@ -44,6 +44,11 @@ def make_ipv4_from_bytes(data):
     return ip.rstrip('.')
 
 
+def make_ns_from_bytes(data):
+    decoded = data.decode('utf-8')
+    return data.decode('ascii')
+
+
 def get_records_from_answer(answer, count):
     ptr = 0
     records = {}
@@ -55,6 +60,8 @@ def get_records_from_answer(answer, count):
         rd_data = ''
         if rec_type == 1:
             rd_data = make_ipv4_from_bytes(answer[ptr + 12:ptr + 12 + rd_length])
+        if rec_type == 2:
+            rd_data = answer[ptr + 12:ptr + 12 + rd_length].hex()
         ptr += 12 + rd_length
         rec_type = MSGController.make_type_from_number(rec_type)
         record['ttl'] = ttl
@@ -66,33 +73,37 @@ def get_records_from_answer(answer, count):
     return records
 
 
-def find_data(domain):
-    request = build_request(domain)
+def find_data(domain, qtype):
+    request = build_request(domain, qtype)
     temp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         temp_sock.sendto(request, GOOGLE_NS)
         data, _ = temp_sock.recvfrom(512)
     finally:
         temp_sock.close()
-    info = make_info_from_response(data, domain)
+    info = make_info_from_response(data, domain, qtype)
     return info
 
 
-def get_info(domain, info_data):
+def get_info(domain, info_data, qtype):
     info_name = '.'.join(domain)
     info = None
     if info_name in info_data:
         print(f'Данные по {info_name} найдены в кэше.')
         info = info_data[info_name]
-        time = datetime.datetime.fromisoformat(info['time'])
-        ttl = info['ttl']
-        current_time = datetime.datetime.now()
-        if (current_time - time).seconds > ttl:
-            print(f'Данные по "{info_name}" устарели. Обращаюсь к старшему ДНС серверу.')
-            info = find_data(domain)
+        if qtype in info['data']:
+            time = datetime.datetime.fromisoformat(info['time'])
+            ttl = info['ttl']
+            current_time = datetime.datetime.now()
+            if (current_time - time).seconds > ttl:
+                print(f'Данные по "{info_name}" устарели. Обращаюсь к старшему ДНС серверу.')
+                info = find_data(domain, qtype)
+        else:
+            print(f'Данные по "{qtype}" запросу не найдены. Обращаюсь к старшему ДНС серверу.')
+            info = find_data(domain, qtype)
     else:
         print(f'В кэше нет данных по "{info_name}". Обращаюсь к старшему ДНС серверу.')
-        info = find_data(domain)
+        info = find_data(domain, qtype)
 
     return info
 
@@ -105,9 +116,12 @@ def get_records(data):
     if question_type == (12).to_bytes(2, byteorder='big'):
         QT = 'ptr'
 
+    if question_type == (2).to_bytes(2, byteorder='big'):
+        QT = 'ns'
+
     recs = None
-    if QT == 'a':
-        info = get_info(domain, INFO_DATA)
+    if QT == 'a' or QT == 'ns':
+        info = get_info(domain, INFO_DATA, QT)
         recs = info['data'][QT]
 
     return recs, QT, domain
@@ -125,6 +139,8 @@ def build_question(domain, rec_type):
 
     if rec_type == 'a':
         question += (1).to_bytes(2, byteorder='big')
+    if rec_type == 'ns':
+        question += (2).to_bytes(2, byteorder='big')
 
     question += (1).to_bytes(2, byteorder='big')  # класс интернет
     return question
@@ -135,16 +151,21 @@ def record_to_bytes(rec_type, ttl, value):
 
     if rec_type == 'a':
         record += bytes([0]) + bytes([1])
+    if rec_type == 'ns':
+        record += bytes([0]) + bytes([2])
 
     record += bytes([0]) + bytes([1])  # класс интернет
     record += int(ttl).to_bytes(4, byteorder='big')
 
-    if rec_type =='a':
+    if rec_type == 'a':
         record += bytes([0]) + bytes([4])
 
         for part in value.split('.'):
             record += bytes([int(part)])
-            
+    if rec_type == 'ns':
+        byte_value = bytes(bytearray.fromhex(value))
+        record += bytes([0]) + bytes([len(byte_value)])
+        record += byte_value
     return record
 
 
@@ -175,7 +196,7 @@ def flags_to_bytes(*args):
     return int(string, 2).to_bytes(1, byteorder='big')
 
 
-def build_request(domain):
+def build_request(domain, qtype):
     ID = b'\xAA\xAA'
     FLAGS = b'\x01\x00'
     QDCOUNT = b'\x00\x01'
@@ -183,11 +204,11 @@ def build_request(domain):
     NSCOUNT = (0).to_bytes(2, byteorder='big')
     ARSCOUNT = (0).to_bytes(2, byteorder='big')
     header = ID + FLAGS + QDCOUNT + ANCOUNT + NSCOUNT + ARSCOUNT
-    question = build_question(domain, 'a')
+    question = build_question(domain, qtype)
     return header + question
 
 
-def build_a_response(data):
+def build_response(data):
     ID = data[0:2]
     FLAGS = build_response_flags(data[2:4])
     QDCOUNT = b'\x00\x01'
@@ -201,16 +222,17 @@ def build_a_response(data):
     question = build_question(domain, rec_type)
     for record in records:
         body += record_to_bytes(rec_type, record['ttl'], record['value'])
-    print(f'Ответ на запрос типа "A" по "{".".join(domain)}" отправлен.')
+    print(f'Ответ на запрос типа "{rec_type}" по "{".".join(domain)}" отправлен.')
     return header + question + body
 
 
-def build_response(data):
+def make_response(data):
     request_info = MSGController.parse_incoming_request(data)
     resp = b''
-    if request_info['question']['QTYPE'] == 'a':
-        print('Получен запрос типа "A". Разрешаю запрос...')
-        resp = build_a_response(data)
+    req_type = request_info['question']['QTYPE']
+    if req_type == 'a' or req_type == 'ns':
+        print(f'Получен запрос типа "{req_type}". Разрешаю запрос...')
+        resp = build_response(data)
 
     return resp
 
@@ -227,6 +249,6 @@ sock.bind((ip, port))
 print('Запуск...')
 while True:
     data, addr = sock.recvfrom(512)
-    response = build_response(data)
+    response = make_response(data)
     sock.sendto(response, addr)
 

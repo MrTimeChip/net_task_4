@@ -90,3 +90,5 @@ class MSGController:
     def make_type_from_number(type):
         if type == 1:
             return 'a'
+        if type == 2:
+            return 'ns'
